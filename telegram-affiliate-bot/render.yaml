@@ -1,7 +1,0 @@
-services:
-  - type: worker
-    name: telegram-affiliate-bot
-    env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py

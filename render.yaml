@@ -1,0 +1,6 @@
+services:
+  - type: web_service
+    name: telegram-affiliate-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py

@@ -1,8 +1,0 @@
-services:
-  - type: worker
-    name: telegram-affiliate-bot
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
-    # plan non specificato: Render userà il piano gratuito (Starter)
-

@@ -1,4 +1,4 @@
-# main.py — correzione: rimosso decorator che causava TypeError
+# main.py — versione con auto-restart watchdog
 import os
 import re
 import asyncio
@@ -46,6 +46,10 @@ def extract_asin_from_amazon_path(path: str) -> Optional[str]:
     return None
 
 def build_affiliate_amazon_url(original_url: str, tag: str) -> str:
+    """
+    Sovrascrive/aggiunge il parametro tag con il tag fornito.
+    Se trova ASIN, ricostruisce l'URL come /dp/ASIN/.
+    """
     try:
         p = urlparse(original_url)
         host = (p.netloc or "").lower()
@@ -91,11 +95,11 @@ async def cleanup_seen_task() -> None:
             del SEEN[k]
         await asyncio.sleep(600)
 
-# ---------------- Telethon client ----------------
-client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
-
+# ---------------- globals che verranno (ri)creati ----------------
+client: Optional[TelegramClient] = None
 HTTP_SESSION: Optional[aiohttp.ClientSession] = None
 
+# ---------------- helper network ----------------
 async def resolve_redirect(url: str) -> str:
     global HTTP_SESSION
     if not HTTP_SESSION:
@@ -103,9 +107,7 @@ async def resolve_redirect(url: str) -> str:
     try:
         timeout = ClientTimeout(total=REQUEST_TIMEOUT)
         async with HTTP_SESSION.get(url, allow_redirects=True, timeout=timeout) as resp:
-            final = str(resp.url)
-            logging.debug(f"Resolved {url} -> {final} (status {resp.status})")
-            return final
+            return str(resp.url)
     except Exception as e:
         logging.debug(f"Impossibile risolvere redirect per {url}: {e}")
         return url
@@ -212,6 +214,7 @@ async def handler(event):
         if getattr(event.message, 'buttons', None):
             buttons = await rebuild_buttons_async(event.message.buttons)
 
+        # MessageMediaWebPage -> invia come testo
         if event.message.media and isinstance(event.message.media, MessageMediaWebPage):
             webpage = getattr(event.message.media, 'webpage', None)
             extracted_url = getattr(webpage, 'url', None) if webpage is not None else None
@@ -224,6 +227,7 @@ async def handler(event):
                 await client.send_message(DEST_CHANNEL, out_text or " ")
             logging.info(f"✅ Inviato WebPage-as-text (msg {msg_id})")
 
+        # altri media
         elif event.message.media:
             caption: str = new_text or ""
             try:
@@ -241,6 +245,7 @@ async def handler(event):
                 except Exception:
                     logging.exception("Errore invio fallback per media")
 
+        # solo testo
         else:
             out_text: str = new_text or " "
             try:
@@ -275,32 +280,110 @@ async def start_health_server() -> None:
     await site.start()
     logging.info(f"Health server avviato su porta {PORT} (per keepalive).")
 
-# ---------------- main ----------------
-async def main() -> None:
-    global HTTP_SESSION
-    asyncio.create_task(cleanup_seen_task())
+# ------------------ monitor & supervisor ------------------
+async def monitor_connection(check_interval: int = 60, max_failures: int = 3) -> None:
+    """
+    Controlla periodicamente la connessione chiamando client.get_me().
+    Se fallisce max_failures volte consecutive, ritorna per causare un restart.
+    """
+    fails = 0
+    while True:
+        await asyncio.sleep(check_interval)
+        try:
+            if client is None:
+                fails += 1
+                logging.warning("Monitor: client è None")
+            else:
+                # chiamata leggera per verificare connessione
+                await asyncio.wait_for(client.get_me(), timeout=10)
+                fails = 0
+        except Exception as e:
+            fails += 1
+            logging.warning(f"Monitor: check fallito ({fails}/{max_failures}): {e}")
+        if fails >= max_failures:
+            logging.error("Monitor: connessione instabile. Richiedo restart del client.")
+            return
 
+async def run_bot_once(backoff_after: int = 0) -> None:
+    """
+    Avvia il client una volta, ritorna al termine (es. monitor chiede restart o eccezione).
+    """
+    global client, HTTP_SESSION
+    if backoff_after:
+        logging.info(f"Attendo {backoff_after}s prima di riavviare...")
+        await asyncio.sleep(backoff_after)
+
+    # (ri)crea client e http session freschi
+    client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
     HTTP_SESSION = aiohttp.ClientSession(timeout=ClientTimeout(total=REQUEST_TIMEOUT))
-    asyncio.create_task(start_health_server())
 
+    # start client e register handler
     await client.start()
-
     if SOURCE_CHANNELS:
         client.add_event_handler(handler, events.NewMessage(chats=SOURCE_CHANNELS))
         logging.info("Handler registrato per i canali sorgente.")
     else:
         logging.warning("Nessun canale sorgente caricato; aggiungi usernames a canali.txt e riavvia per attivare l'ascolto.")
 
+    # avvia health e monitor
+    health_task = asyncio.create_task(start_health_server())
+    monitor_task = asyncio.create_task(monitor_connection())
+
     logging.info("🚀 PixelAffari userbot avviato e in ascolto...")
+
     try:
-        await asyncio.Event().wait()
+        # attendi che il monitor ritorni (se richiede restart) oppure che il client sia disconnesso
+        await monitor_task
     finally:
-        if HTTP_SESSION and not HTTP_SESSION.closed:
-            await HTTP_SESSION.close()
-        await client.disconnect()
+        # cleanup: rimuovi handler, chiudi sessioni
+        try:
+            client.remove_event_handler(handler)
+        except Exception:
+            pass
+        try:
+            if HTTP_SESSION and not HTTP_SESSION.closed:
+                await HTTP_SESSION.close()
+        except Exception:
+            pass
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        try:
+            if not health_task.done():
+                health_task.cancel()
+                await asyncio.sleep(0)  # yield
+        except Exception:
+            pass
+        logging.info("Run ended, risorse pulite. Torno al supervisor per possibile restart.")
+
+async def supervisor_loop():
+    """
+    Mantiene il bot attivo: chiama run_bot_once() in loop con backoff esponenziale.
+    """
+    backoff = 5
+    while True:
+        try:
+            await run_bot_once(backoff_after=0)
+            # se run_bot_once ritorna normalmente (monitor triggered), riavvia con backoff
+            logging.info(f"Supervisor: riavvio in {backoff}s")
+        except Exception:
+            logging.exception("Supervisor: run_bot_once ha sollevato eccezione")
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 300)  # cap max 5 minuti
+
+# ---------------- main ----------------
+async def main() -> None:
+    # start background cleanup once
+    asyncio.create_task(cleanup_seen_task())
+
+    # avvia il supervisor loop (mantiene il bot e riavvii interni)
+    await supervisor_loop()
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logging.info("Arresto richiesto manualmente.")
+
+

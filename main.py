@@ -1,4 +1,4 @@
-# main.py — versione definitiva corretta
+# main.py — correzione: rimosso decorator che causava TypeError
 import os
 import re
 import asyncio
@@ -10,7 +10,6 @@ from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import aiohttp
 from aiohttp import ClientTimeout, web
-
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageMediaWebPage
@@ -22,14 +21,13 @@ API_ID = int(os.environ['API_ID'])
 API_HASH = os.environ['API_HASH']
 STRING_SESSION = os.environ['STRING_SESSION']
 DEST_CHANNEL_RAW = os.environ.get('DEST_CHANNEL', '@PixelAffari')
-AFFILIATE_TAG = os.environ.get('AFFILIATE_TAG', 'pixelofferte-21')  # inserisci solo il tag, es: pixelofferte-21
+AFFILIATE_TAG = os.environ.get('AFFILIATE_TAG', 'pixelofferte-21')
 FORWARD_ALL = os.environ.get('FORWARD_ALL', 'true').lower() in ('1', 'true', 'yes')
 ANTI_SPAM_DELAY = float(os.environ.get('ANTI_SPAM_DELAY', '5'))
 SEEN_TTL = int(os.environ.get('SEEN_TTL', str(24 * 3600)))
 PORT = int(os.environ.get('PORT', '8080'))
 REQUEST_TIMEOUT = float(os.environ.get('REQUEST_TIMEOUT', '8'))
 
-# Normalizza DEST_CHANNEL (accetta ID numerico o @username)
 try:
     DEST_CHANNEL = int(DEST_CHANNEL_RAW)
 except Exception:
@@ -48,10 +46,6 @@ def extract_asin_from_amazon_path(path: str) -> Optional[str]:
     return None
 
 def build_affiliate_amazon_url(original_url: str, tag: str) -> str:
-    """
-    Sempre sovrascrive/aggiunge il parametro tag con il tag fornito.
-    Se trova ASIN, ricostruisce l'URL come /dp/ASIN/ mantenendo altri parametri se presenti.
-    """
     try:
         p = urlparse(original_url)
         host = (p.netloc or "").lower()
@@ -59,7 +53,6 @@ def build_affiliate_amazon_url(original_url: str, tag: str) -> str:
             return original_url
 
         qs = parse_qs(p.query)
-        # sovrascrivi il tag
         q = {k: v for k, v in qs.items()}
         q['tag'] = [tag]
 
@@ -101,14 +94,9 @@ async def cleanup_seen_task() -> None:
 # ---------------- Telethon client ----------------
 client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
-# HTTP session per risolvere short-links (amzn.to)
 HTTP_SESSION: Optional[aiohttp.ClientSession] = None
 
 async def resolve_redirect(url: str) -> str:
-    """
-    Segue redirect (es. amzn.to) e ritorna URL finale.
-    Se fallisce, ritorna l'URL originale.
-    """
     global HTTP_SESSION
     if not HTTP_SESSION:
         return url
@@ -123,10 +111,6 @@ async def resolve_redirect(url: str) -> str:
         return url
 
 async def transform_links_in_text_async(text: str) -> Tuple[str, List[Tuple[str, str]]]:
-    """
-    Risolve short links (amzn.to, amzn.*) e sovrascrive/aggiunge il tag di affiliazione per amazon.*.
-    Restituisce (testo_sostituito, lista_coppie_old_new).
-    """
     if not text:
         return text, []
     links = LINK_RE.findall(text)
@@ -134,7 +118,6 @@ async def transform_links_in_text_async(text: str) -> Tuple[str, List[Tuple[str,
     fixed_links: List[Tuple[str, str]] = []
 
     for orig in links:
-        # conserva eventuale punteggiatura finale
         stripped = orig.rstrip(string.punctuation)
         suffix = orig[len(stripped):]
         candidate = stripped
@@ -142,7 +125,6 @@ async def transform_links_in_text_async(text: str) -> Tuple[str, List[Tuple[str,
         parsed = urlparse(stripped)
         host = (parsed.netloc or "").lower()
 
-        # se short-link amzn.to o amzn.* (non amazon), prova a risolvere
         if 'amzn.to' in host or (host.startswith('amzn.') and 'amazon.' not in host):
             resolved = await resolve_redirect(stripped)
             candidate = resolved
@@ -156,7 +138,6 @@ async def transform_links_in_text_async(text: str) -> Tuple[str, List[Tuple[str,
                 fixed_links.append((orig, replacement))
                 logging.info(f"[AmazonTagFix] {orig} -> {replacement}")
             else:
-                # fallback: prova con stripped
                 fallback = build_affiliate_amazon_url(stripped, AFFILIATE_TAG)
                 if fallback != stripped:
                     replacement = fallback + suffix
@@ -164,7 +145,6 @@ async def transform_links_in_text_async(text: str) -> Tuple[str, List[Tuple[str,
                     fixed_links.append((orig, replacement))
                     logging.info(f"[AmazonTagFix-fallback] {orig} -> {replacement}")
         else:
-            # host originario contenente amazon.* (ma matching differente)
             if 'amazon.' in host:
                 new_url = build_affiliate_amazon_url(stripped, AFFILIATE_TAG)
                 if new_url != stripped:
@@ -176,10 +156,6 @@ async def transform_links_in_text_async(text: str) -> Tuple[str, List[Tuple[str,
     return replaced, fixed_links
 
 async def rebuild_buttons_async(original_buttons) -> Optional[List[List[Button]]]:
-    """
-    Ricostruisce i bottoni URL aggiornando gli href amazon/amzn.
-    Ritorna lista di liste di Button o None.
-    """
     if not original_buttons:
         return None
     new = []
@@ -187,7 +163,6 @@ async def rebuild_buttons_async(original_buttons) -> Optional[List[List[Button]]
         for row in original_buttons:
             new_row = []
             for b in row:
-                # prova a leggere text e url
                 text = getattr(b, 'text', None)
                 url = getattr(b, 'url', None)
                 if not text and getattr(b, 'button', None):
@@ -203,7 +178,6 @@ async def rebuild_buttons_async(original_buttons) -> Optional[List[List[Button]]
                         final_url = build_affiliate_amazon_url(final_url, AFFILIATE_TAG)
                     new_row.append(Button.url(text, final_url))
                 else:
-                    # conserva oggetto non-URL se possibile
                     try:
                         new_row.append(b)
                     except Exception:
@@ -214,8 +188,7 @@ async def rebuild_buttons_async(original_buttons) -> Optional[List[List[Button]]
         logging.exception("Errore durante rebuild_buttons_async")
         return None
 
-# ---------- handler ----------
-@events.register  # decoratore non usato direttamente, registro dinamicamente in main()
+# ---------- handler (NO decorator) ----------
 async def handler(event):
     try:
         chat_id = getattr(event.chat, 'id', None) or event.chat_id
@@ -229,19 +202,16 @@ async def handler(event):
         raw_text = event.message.message or ""
         new_text, fixed_links = await transform_links_in_text_async(raw_text)
 
-        # filtro se necessario
         if (not FORWARD_ALL):
             found = any(('amazon.' in l or 'zalando' in l or 'ebay.' in l) for l in LINK_RE.findall(raw_text or ""))
             if not found:
                 logging.info("🔍 Messaggio filtrato (no link target)")
                 return
 
-        # ricostruisci bottoni se presenti (async)
         buttons = None
         if getattr(event.message, 'buttons', None):
             buttons = await rebuild_buttons_async(event.message.buttons)
 
-        # MessageMediaWebPage -> invia come testo (non usare send_file)
         if event.message.media and isinstance(event.message.media, MessageMediaWebPage):
             webpage = getattr(event.message.media, 'webpage', None)
             extracted_url = getattr(webpage, 'url', None) if webpage is not None else None
@@ -254,7 +224,6 @@ async def handler(event):
                 await client.send_message(DEST_CHANNEL, out_text or " ")
             logging.info(f"✅ Inviato WebPage-as-text (msg {msg_id})")
 
-        # Altri media (foto, video, doc) -> send_file (caption sempre str)
         elif event.message.media:
             caption: str = new_text or ""
             try:
@@ -272,7 +241,6 @@ async def handler(event):
                 except Exception:
                     logging.exception("Errore invio fallback per media")
 
-        # Solo testo
         else:
             out_text: str = new_text or " "
             try:
@@ -284,17 +252,15 @@ async def handler(event):
             except Exception:
                 logging.exception("Errore invio testo")
 
-        # log eventuali sostituzioni
         for old, new in fixed_links:
             logging.info(f"🔁 Link modificato: {old} -> {new}")
 
-        # anti-spam
         await asyncio.sleep(ANTI_SPAM_DELAY)
 
     except Exception:
         logging.exception("Errore nel handler")
 
-# ---------------------- small health server ----------------------
+# ---------------------- health server ----------------------
 async def handle_ping(request):
     logging.info("Ping ricevuto (UptimeRobot o browser).")
     return web.Response(text="PixelAffari alive")
@@ -312,19 +278,13 @@ async def start_health_server() -> None:
 # ---------------- main ----------------
 async def main() -> None:
     global HTTP_SESSION
-    # start background tasks
     asyncio.create_task(cleanup_seen_task())
 
-    # crea sessione HTTP per risolvere short-links
     HTTP_SESSION = aiohttp.ClientSession(timeout=ClientTimeout(total=REQUEST_TIMEOUT))
-
-    # avvia health server
     asyncio.create_task(start_health_server())
 
-    # avvia client
     await client.start()
 
-    # registra handler (senza await) solo se ci sono canali
     if SOURCE_CHANNELS:
         client.add_event_handler(handler, events.NewMessage(chats=SOURCE_CHANNELS))
         logging.info("Handler registrato per i canali sorgente.")
@@ -335,7 +295,6 @@ async def main() -> None:
     try:
         await asyncio.Event().wait()
     finally:
-        # pulizie
         if HTTP_SESSION and not HTTP_SESSION.closed:
             await HTTP_SESSION.close()
         await client.disconnect()

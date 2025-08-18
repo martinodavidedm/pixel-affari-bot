@@ -5,7 +5,7 @@ import asyncio
 import time
 import logging
 import string
-from typing import Optional, List, Tuple, Callable, Any
+from typing import Optional, List, Tuple, Any
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import aiohttp
@@ -59,7 +59,6 @@ def build_affiliate_amazon_url(original_url: str, tag: str) -> str:
     """
     Sovrascrive/aggiunge il parametro tag con il tag fornito.
     Se trova ASIN, ricostruisce l'URL come /dp/ASIN/.
-    Gestisce anche URL già con query: sostituisce/aggiunge 'tag='.
     """
     try:
         p = urlparse(original_url)
@@ -94,6 +93,11 @@ def load_sources(fname: str = 'canali.txt') -> List[str]:
 
 SOURCE_CHANNELS = load_sources()
 logging.info(f"Canali sorgente caricati: {SOURCE_CHANNELS}")
+
+def _norm_uname(u: str) -> str:
+    return (u or "").lower().lstrip('@').strip()
+
+SOURCE_UNAMES = {_norm_uname(u) for u in SOURCE_CHANNELS}
 
 # ---------------- dedupe cache ----------------
 SEEN: dict[Tuple[int, int], float] = {}  # (chat_id, msg_id) -> timestamp
@@ -275,9 +279,14 @@ async def keep_channels_alive():
                     logging.warning(f"[KeepAlive] errore su {ch}: {e}")
         await asyncio.sleep(KEEPALIVE_INTERVAL)
 
-# ---------- handler (NO decorator) ----------
+# ---------- handler (NO decorator, filtro interno) ----------
 async def handler(event):
     try:
+        # Filtro interno sui canali interessati
+        uname = _norm_uname(getattr(getattr(event, 'chat', None), 'username', '') or '')
+        if uname not in SOURCE_UNAMES:
+            return
+
         chat_id = getattr(event.chat, 'id', None) or event.chat_id
         msg_id = event.message.id
         key = (chat_id, msg_id)
@@ -299,7 +308,7 @@ async def handler(event):
         if getattr(event.message, 'buttons', None):
             buttons = await rebuild_buttons_async(event.message.buttons)
 
-        # MessageMediaWebPage -> invia come testo (con preview se vuoi)
+        # MessageMediaWebPage -> invia come testo
         if event.message.media and isinstance(event.message.media, MessageMediaWebPage):
             webpage = getattr(event.message.media, 'webpage', None)
             extracted_url = getattr(webpage, 'url', None) if webpage is not None else None
@@ -308,7 +317,7 @@ async def handler(event):
                 out_text = out_text.replace(extracted_url, build_affiliate_amazon_url(extracted_url, AFFILIATE_TAG))
             try:
                 await send_message_with_retry(DEST_CHANNEL, out_text, buttons=buttons, link_preview=True)
-                logging.info(f"✅ Inviato WebPage-as-text (msg {msg_id})")
+                logging.info(f"✅ Inviato WebPage-as-text (msg {msg_id}) da @{uname}")
             except Exception:
                 logging.exception("Errore invio WebPage-as-text")
 
@@ -317,7 +326,7 @@ async def handler(event):
             caption: str = new_text or " "
             try:
                 await send_file_with_retry(DEST_CHANNEL, event.message.media, caption=caption, buttons=buttons)
-                logging.info(f"✅ Inviato media (msg {msg_id}) da {getattr(event.chat,'username',chat_id)}")
+                logging.info(f"✅ Inviato media (msg {msg_id}) da @{uname}")
             except Exception as e:
                 logging.warning(f"Forward media fallito ({e}), invio fallback testo.")
                 try:
@@ -332,9 +341,9 @@ async def handler(event):
             out_text: str = new_text or " "
             try:
                 await send_message_with_retry(DEST_CHANNEL, out_text, buttons=buttons, link_preview=True)
-                logging.info(f"✅ Inviato testo (msg {msg_id}) da {getattr(event.chat,'username',chat_id)}")
+                logging.info(f"✅ Inviato testo (msg {msg_id}) da @{uname}")
             except Exception:
-                logging.exception("Erroro invio testo")
+                logging.exception("Errore invio testo")
 
         for old, new in fixed_links:
             logging.info(f"🔁 Link modificato: {old} -> {new}")
@@ -374,7 +383,6 @@ async def monitor_connection(check_interval: int = 60, max_failures: int = 3) ->
                 fails += 1
                 logging.warning("Monitor: client è None")
             else:
-                # chiamata leggera per verificare connessione
                 await asyncio.wait_for(client.get_me(), timeout=10)
                 fails = 0
         except Exception as e:
@@ -383,6 +391,17 @@ async def monitor_connection(check_interval: int = 60, max_failures: int = 3) ->
         if fails >= max_failures:
             logging.error("Monitor: connessione instabile. Richiedo restart del client.")
             return
+
+async def prime_entities():
+    """Best-effort: risolve le entity dei canali per scaldare la cache."""
+    if not SOURCE_CHANNELS:
+        return
+    for ch in SOURCE_CHANNELS:
+        try:
+            ent = await client.get_entity(ch)
+            logging.info(f"Prime entity ok: {ch} -> {getattr(ent, 'id', None)}")
+        except Exception as e:
+            logging.warning(f"Prime entity fallita per {ch}: {e}")
 
 async def run_bot_once(backoff_after: int = 0) -> None:
     """
@@ -397,13 +416,13 @@ async def run_bot_once(backoff_after: int = 0) -> None:
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
     HTTP_SESSION = aiohttp.ClientSession(timeout=ClientTimeout(total=REQUEST_TIMEOUT))
 
-    # start client e register handler
+    # start client e register handler (senza filtro chats, filtro interno nel corpo)
     await client.start()
-    if SOURCE_CHANNELS:
-        client.add_event_handler(handler, events.NewMessage(chats=SOURCE_CHANNELS))
-        logging.info("Handler registrato per i canali sorgente.")
-    else:
-        logging.warning("Nessun canale sorgente caricato; aggiungi usernames a canali.txt e riavvia per attivare l'ascolto.")
+    client.add_event_handler(handler, events.NewMessage())
+    logging.info("Handler globale registrato (filtro canali interno).")
+
+    # Warm-up entity cache
+    await prime_entities()
 
     # avvia health, monitor, keepalive, cleanup
     health_task = asyncio.create_task(start_health_server())
@@ -448,7 +467,6 @@ async def supervisor_loop():
     while True:
         try:
             await run_bot_once(backoff_after=0)
-            # se run_bot_once ritorna normalmente (monitor triggered), riavvia con backoff
             logging.info(f"Supervisor: riavvio in {backoff}s")
         except Exception:
             logging.exception("Supervisor: run_bot_once ha sollevato eccezione")
@@ -457,7 +475,6 @@ async def supervisor_loop():
 
 # ---------------- main ----------------
 async def main() -> None:
-    # il cleanup task viene avviato in run_bot_once per legarsi al suo ciclo vita
     await supervisor_loop()
 
 if __name__ == '__main__':
@@ -465,6 +482,7 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         logging.info("Arresto richiesto manualmente.")
+
 
 
 

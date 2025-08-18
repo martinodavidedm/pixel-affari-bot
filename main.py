@@ -1,11 +1,11 @@
-# main.py — versione con auto-restart watchdog + keepalive canali + retry invio
+# main.py — watchdog + keepalive + retry + filtro per chat_id/username robusto
 import os
 import re
 import asyncio
 import time
 import logging
 import string
-from typing import Optional, List, Tuple, Any
+from typing import Optional, List, Tuple, Any, Dict, Set
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 import aiohttp
@@ -46,20 +46,19 @@ LINK_RE = re.compile(r'https?://[^\s\)\]\>"]+')
 def extract_asin_from_amazon_path(path: str) -> Optional[str]:
     if not path:
         return None
-    for pattern in (r'/dp/([A-Z0-9]{10})',
-                    r'/gp/product/([A-Z0-9]{10})',
-                    r'/gp/aw/d/([A-Z0-9]{10})',
-                    r'/product/([A-Z0-9]{10})'):
+    for pattern in (
+        r'/dp/([A-Z0-9]{10})',
+        r'/gp/product/([A-Z0-9]{10})',
+        r'/gp/aw/d/([A-Z0-9]{10})',
+        r'/product/([A-Z0-9]{10})'
+    ):
         m = re.search(pattern, path)
         if m:
             return m.group(1)
     return None
 
 def build_affiliate_amazon_url(original_url: str, tag: str) -> str:
-    """
-    Sovrascrive/aggiunge il parametro tag con il tag fornito.
-    Se trova ASIN, ricostruisce l'URL come /dp/ASIN/.
-    """
+    """Forza/aggiunge il parametro tag e, se c’è ASIN, normalizza in /dp/ASIN/."""
     try:
         p = urlparse(original_url)
         host = (p.netloc or "").lower()
@@ -67,21 +66,21 @@ def build_affiliate_amazon_url(original_url: str, tag: str) -> str:
             return original_url
 
         qs = parse_qs(p.query)
-        q = {k: v for k, v in qs.items()}
-        q['tag'] = [tag]
+        qs['tag'] = [tag]
 
         asin = extract_asin_from_amazon_path(p.path)
         if asin:
             new_path = f'/dp/{asin}/'
-            new_query = urlencode({k: v[0] for k, v in q.items()})
-            new_url = urlunparse((p.scheme, p.netloc, new_path, '', new_query, ''))
-            return new_url
+            new_query = urlencode({k: v[0] for k, v in qs.items()})
+            return urlunparse((p.scheme, p.netloc, new_path, '', new_query, ''))
 
-        new_query = urlencode({k: v[0] for k, v in q.items()})
-        new_url = urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
-        return new_url
+        new_query = urlencode({k: v[0] for k, v in qs.items()})
+        return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
     except Exception:
         return original_url
+
+def _norm_uname(u: str) -> str:
+    return (u or "").lower().lstrip('@').strip()
 
 # ---------------- carica canali ----------------
 def load_sources(fname: str = 'canali.txt') -> List[str]:
@@ -91,16 +90,12 @@ def load_sources(fname: str = 'canali.txt') -> List[str]:
     with open(fname, 'r', encoding='utf-8') as f:
         return [ln.strip() for ln in f if ln.strip()]
 
-SOURCE_CHANNELS = load_sources()
+SOURCE_CHANNELS: List[str] = load_sources()
+SOURCE_UNAMES: Set[str] = {_norm_uname(u) for u in SOURCE_CHANNELS}
 logging.info(f"Canali sorgente caricati: {SOURCE_CHANNELS}")
 
-def _norm_uname(u: str) -> str:
-    return (u or "").lower().lstrip('@').strip()
-
-SOURCE_UNAMES = {_norm_uname(u) for u in SOURCE_CHANNELS}
-
 # ---------------- dedupe cache ----------------
-SEEN: dict[Tuple[int, int], float] = {}  # (chat_id, msg_id) -> timestamp
+SEEN: Dict[Tuple[int, int], float] = {}  # (chat_id, msg_id) -> timestamp
 
 async def cleanup_seen_task() -> None:
     while True:
@@ -110,16 +105,16 @@ async def cleanup_seen_task() -> None:
             del SEEN[k]
         await asyncio.sleep(600)
 
-# ---------------- globals che verranno (ri)creati ----------------
+# ---------------- globals ----------------
 client: Optional[TelegramClient] = None
 HTTP_SESSION: Optional[aiohttp.ClientSession] = None
 
-# ---------------- helper network ----------------
+# Mappa di supporto: username -> chat_id e set di chat_id ammessi
+SOURCE_ID_BY_UNAME: Dict[str, int] = {}
+SOURCE_IDS: Set[int] = set()
+
+# ---------------- network helpers ----------------
 async def resolve_redirect(url: str) -> str:
-    """
-    Risolve shortener tipo amzn.to o amzn.* -> URL finale.
-    Se HTTP_SESSION non c'è, restituisce l'URL originale.
-    """
     global HTTP_SESSION
     if not HTTP_SESSION:
         return url
@@ -132,10 +127,6 @@ async def resolve_redirect(url: str) -> str:
         return url
 
 async def transform_links_in_text_async(text: str) -> Tuple[str, List[Tuple[str, str]]]:
-    """
-    Cerca link nel testo, risolve redirect per amzn.* e applica il tag affiliato a tutti i link amazon.*
-    Mantiene punteggiatura attaccata (es. ')' o '.').
-    """
     if not text:
         return text, []
     links = LINK_RE.findall(text)
@@ -150,10 +141,9 @@ async def transform_links_in_text_async(text: str) -> Tuple[str, List[Tuple[str,
         parsed = urlparse(stripped)
         host = (parsed.netloc or "").lower()
 
-        # Risolvi shortener 'amzn.to' o sottodomini amzn.*
+        # shorteners amzn.*
         if 'amzn.to' in host or (host.startswith('amzn.') and 'amazon.' not in host):
-            resolved = await resolve_redirect(stripped)
-            candidate = resolved
+            candidate = await resolve_redirect(stripped)
 
         final_host = (urlparse(candidate).netloc or "").lower()
         if 'amazon.' in final_host:
@@ -164,7 +154,6 @@ async def transform_links_in_text_async(text: str) -> Tuple[str, List[Tuple[str,
                 fixed_links.append((orig, replacement))
                 logging.info(f"[AmazonTagFix] {orig} -> {replacement}")
             else:
-                # fallback: prova almeno a forzare il tag sull'originale 'stripped'
                 fallback = build_affiliate_amazon_url(stripped, AFFILIATE_TAG)
                 if fallback != stripped:
                     replacement = fallback + suffix
@@ -172,7 +161,6 @@ async def transform_links_in_text_async(text: str) -> Tuple[str, List[Tuple[str,
                     fixed_links.append((orig, replacement))
                     logging.info(f"[AmazonTagFix-fallback] {orig} -> {replacement}")
         else:
-            # caso “host” iniziale che contiene amazon ma candidate no
             if 'amazon.' in host:
                 new_url = build_affiliate_amazon_url(stripped, AFFILIATE_TAG)
                 if new_url != stripped:
@@ -184,10 +172,6 @@ async def transform_links_in_text_async(text: str) -> Tuple[str, List[Tuple[str,
     return replaced, fixed_links
 
 async def rebuild_buttons_async(original_buttons) -> Optional[List[List[Button]]]:
-    """
-    Ricrea i bottoni URL applicando risoluzione redirect e tag affiliato su amazon.*
-    Gestisce sia Button.url che altri formati compatibili con Telethon (attr 'button').
-    """
     if not original_buttons:
         return None
     new = []
@@ -220,16 +204,9 @@ async def rebuild_buttons_async(original_buttons) -> Optional[List[List[Button]]
         logging.exception("Errore durante rebuild_buttons_async")
         return None
 
-# ---------------- helper retry generici ----------------
-async def send_message_with_retry(
-    dest: Any,
-    text: str,
-    *,
-    buttons=None,
-    link_preview: bool = True,
-    max_retries: int = MAX_RETRIES,
-    base_delay: float = RETRY_BASE_DELAY
-) -> None:
+# ---------------- send con retry ----------------
+async def send_message_with_retry(dest: Any, text: str, *, buttons=None, link_preview: bool = True,
+                                  max_retries: int = MAX_RETRIES, base_delay: float = RETRY_BASE_DELAY) -> None:
     delay = base_delay
     for attempt in range(1, max_retries + 1):
         try:
@@ -242,15 +219,8 @@ async def send_message_with_retry(
             await asyncio.sleep(delay)
             delay *= 2
 
-async def send_file_with_retry(
-    dest: Any,
-    media: Any,
-    *,
-    caption: str,
-    buttons=None,
-    max_retries: int = MAX_RETRIES,
-    base_delay: float = RETRY_BASE_DELAY
-) -> None:
+async def send_file_with_retry(dest: Any, media: Any, *, caption: str, buttons=None,
+                               max_retries: int = MAX_RETRIES, base_delay: float = RETRY_BASE_DELAY) -> None:
     delay = base_delay
     for attempt in range(1, max_retries + 1):
         try:
@@ -263,15 +233,14 @@ async def send_file_with_retry(
             await asyncio.sleep(delay)
             delay *= 2
 
-# ---------------- KEEPALIVE canali ----------------
+# ---------------- keepalive ----------------
 async def keep_channels_alive():
-    """
-    Ogni KEEPALIVE_INTERVAL secondi interroga l'ultimo messaggio di ciascun canale sorgente,
-    per mantenere la subscription degli updates attiva lato Telegram.
-    """
     while True:
-        if client and SOURCE_CHANNELS:
-            for ch in SOURCE_CHANNELS:
+        if client and (SOURCE_IDS or SOURCE_CHANNELS):
+            targets = list(SOURCE_IDS)  # prefer chat_id se li abbiamo
+            if not targets:
+                targets = SOURCE_CHANNELS
+            for ch in targets:
                 try:
                     await client.get_messages(ch, limit=1)
                     logging.debug(f"[KeepAlive] ping su {ch}")
@@ -279,17 +248,26 @@ async def keep_channels_alive():
                     logging.warning(f"[KeepAlive] errore su {ch}: {e}")
         await asyncio.sleep(KEEPALIVE_INTERVAL)
 
-# ---------- handler (NO decorator, filtro interno) ----------
+# ---------------- handler ----------------
 async def handler(event):
     try:
-        # Filtro interno sui canali interessati
-        uname = _norm_uname(getattr(getattr(event, 'chat', None), 'username', '') or '')
-        if uname not in SOURCE_UNAMES:
+        # ricava username (se presente) e chat_id
+        username = _norm_uname(getattr(getattr(event, 'chat', None), 'username', '') or '')
+        cid = getattr(event, 'chat_id', None)
+
+        allowed = False
+        if cid is not None and cid in SOURCE_IDS:
+            allowed = True
+        elif username and username in SOURCE_UNAMES:
+            allowed = True
+
+        if not allowed:
+            # Loggare una volta ogni tanto aiuta a diagnosticare, ma non intasiamo i log
+            logging.debug(f"Skip msg da chat_id={cid} uname=@{username} (non in lista)")
             return
 
-        chat_id = getattr(event.chat, 'id', None) or event.chat_id
         msg_id = event.message.id
-        key = (chat_id, msg_id)
+        key = (cid or 0, msg_id)
         if key in SEEN:
             logging.info("⏩ Ignoro messaggio duplicato")
             return
@@ -298,7 +276,7 @@ async def handler(event):
         raw_text = event.message.message or ""
         new_text, fixed_links = await transform_links_in_text_async(raw_text)
 
-        if (not FORWARD_ALL):
+        if not FORWARD_ALL:
             found = any(('amazon.' in l or 'zalando' in l or 'ebay.' in l) for l in LINK_RE.findall(raw_text or ""))
             if not found:
                 logging.info("🔍 Messaggio filtrato (no link target)")
@@ -308,7 +286,7 @@ async def handler(event):
         if getattr(event.message, 'buttons', None):
             buttons = await rebuild_buttons_async(event.message.buttons)
 
-        # MessageMediaWebPage -> invia come testo
+        # WebPage → come testo
         if event.message.media and isinstance(event.message.media, MessageMediaWebPage):
             webpage = getattr(event.message.media, 'webpage', None)
             extracted_url = getattr(webpage, 'url', None) if webpage is not None else None
@@ -317,16 +295,16 @@ async def handler(event):
                 out_text = out_text.replace(extracted_url, build_affiliate_amazon_url(extracted_url, AFFILIATE_TAG))
             try:
                 await send_message_with_retry(DEST_CHANNEL, out_text, buttons=buttons, link_preview=True)
-                logging.info(f"✅ Inviato WebPage-as-text (msg {msg_id}) da @{uname}")
+                logging.info(f"✅ Inviato WebPage-as-text (msg {msg_id}) da @{username or cid}")
             except Exception:
                 logging.exception("Errore invio WebPage-as-text")
 
         # altri media
         elif event.message.media:
-            caption: str = new_text or " "
+            caption = new_text or " "
             try:
                 await send_file_with_retry(DEST_CHANNEL, event.message.media, caption=caption, buttons=buttons)
-                logging.info(f"✅ Inviato media (msg {msg_id}) da @{uname}")
+                logging.info(f"✅ Inviato media (msg {msg_id}) da @{username or cid}")
             except Exception as e:
                 logging.warning(f"Forward media fallito ({e}), invio fallback testo.")
                 try:
@@ -338,10 +316,10 @@ async def handler(event):
 
         # solo testo
         else:
-            out_text: str = new_text or " "
+            out_text = new_text or " "
             try:
                 await send_message_with_retry(DEST_CHANNEL, out_text, buttons=buttons, link_preview=True)
-                logging.info(f"✅ Inviato testo (msg {msg_id}) da @{uname}")
+                logging.info(f"✅ Inviato testo (msg {msg_id}) da @{username or cid}")
             except Exception:
                 logging.exception("Errore invio testo")
 
@@ -353,7 +331,7 @@ async def handler(event):
     except Exception:
         logging.exception("Errore nel handler")
 
-# ---------------------- health server ----------------------
+# ---------------- health ----------------
 async def handle_ping(request):
     logging.info("Ping ricevuto (UptimeRobot o browser).")
     return web.Response(text="PixelAffari alive")
@@ -369,12 +347,8 @@ async def start_health_server() -> None:
     await site.start()
     logging.info(f"Health server avviato su porta {PORT} (per keepalive).")
 
-# ------------------ monitor & supervisor ------------------
+# ---------------- monitor & supervisor ----------------
 async def monitor_connection(check_interval: int = 60, max_failures: int = 3) -> None:
-    """
-    Controlla periodicamente la connessione chiamando client.get_me().
-    Se fallisce max_failures volte consecutive, ritorna per causare un restart.
-    """
     fails = 0
     while True:
         await asyncio.sleep(check_interval)
@@ -392,39 +366,48 @@ async def monitor_connection(check_interval: int = 60, max_failures: int = 3) ->
             logging.error("Monitor: connessione instabile. Richiedo restart del client.")
             return
 
-async def prime_entities():
-    """Best-effort: risolve le entity dei canali per scaldare la cache."""
+async def prime_entities() -> None:
+    """Risolvi entity e costruisci mapping username->id e set ID per match robusto."""
+    global SOURCE_ID_BY_UNAME, SOURCE_IDS
+    SOURCE_ID_BY_UNAME = {}
+    SOURCE_IDS = set()
+
     if not SOURCE_CHANNELS:
         return
+
     for ch in SOURCE_CHANNELS:
+        uname = _norm_uname(ch)
         try:
             ent = await client.get_entity(ch)
-            logging.info(f"Prime entity ok: {ch} -> {getattr(ent, 'id', None)}")
+            cid = getattr(ent, 'id', None)
+            if isinstance(cid, int):
+                SOURCE_ID_BY_UNAME[uname] = cid
+                SOURCE_IDS.add(cid)
+                logging.info(f"Prime entity ok: {ch} -> chat_id={cid}")
+            else:
+                logging.warning(f"Prime entity: id non valido per {ch}")
         except Exception as e:
             logging.warning(f"Prime entity fallita per {ch}: {e}")
 
 async def run_bot_once(backoff_after: int = 0) -> None:
-    """
-    Avvia il client una volta, ritorna al termine (es. monitor chiede restart o eccezione).
-    """
     global client, HTTP_SESSION
     if backoff_after:
         logging.info(f"Attendo {backoff_after}s prima di riavviare...")
         await asyncio.sleep(backoff_after)
 
-    # (ri)crea client e http session freschi
     client = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
     HTTP_SESSION = aiohttp.ClientSession(timeout=ClientTimeout(total=REQUEST_TIMEOUT))
 
-    # start client e register handler (senza filtro chats, filtro interno nel corpo)
     await client.start()
-    client.add_event_handler(handler, events.NewMessage())
-    logging.info("Handler globale registrato (filtro canali interno).")
 
-    # Warm-up entity cache
+    # Handler globale (niente filtro chats: filtriamo dentro l'handler per id/username)
+    client.add_event_handler(handler, events.NewMessage(incoming=True))
+    logging.info("Handler globale registrato (filtro per id/username interno).")
+
+    # Warm-up entity cache e popolamento ID
     await prime_entities()
 
-    # avvia health, monitor, keepalive, cleanup
+    # Task di servizio
     health_task = asyncio.create_task(start_health_server())
     monitor_task = asyncio.create_task(monitor_connection())
     keepalive_task = asyncio.create_task(keep_channels_alive())
@@ -433,10 +416,8 @@ async def run_bot_once(backoff_after: int = 0) -> None:
     logging.info("🚀 PixelAffari userbot avviato e in ascolto...")
 
     try:
-        # attendi che il monitor ritorni (se richiede restart) oppure che il client sia disconnesso
         await monitor_task
     finally:
-        # cleanup: rimuovi handler, chiudi sessioni
         try:
             client.remove_event_handler(handler)
         except Exception:
@@ -454,15 +435,12 @@ async def run_bot_once(backoff_after: int = 0) -> None:
             try:
                 if not task.done():
                     task.cancel()
-                    await asyncio.sleep(0)  # yield
+                    await asyncio.sleep(0)
             except Exception:
                 pass
         logging.info("Run ended, risorse pulite. Torno al supervisor per possibile restart.")
 
 async def supervisor_loop():
-    """
-    Mantiene il bot attivo: chiama run_bot_once() in loop con backoff esponenziale.
-    """
     backoff = 5
     while True:
         try:
@@ -471,7 +449,7 @@ async def supervisor_loop():
         except Exception:
             logging.exception("Supervisor: run_bot_once ha sollevato eccezione")
         await asyncio.sleep(backoff)
-        backoff = min(backoff * 2, 300)  # cap max 5 minuti
+        backoff = min(backoff * 2, 300)
 
 # ---------------- main ----------------
 async def main() -> None:
@@ -482,6 +460,7 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         logging.info("Arresto richiesto manualmente.")
+
 
 
 
